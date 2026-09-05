@@ -38,7 +38,7 @@ repo layout*.
 | Question | Decision |
 |---|---|
 | Command surface | Slash commands typed into **email replies** (real Slack/Discord deferred) |
-| Gmail auth | Undecided — abstract behind an interface, compare both below |
+| Gmail auth | **IMAP + SMTP with a Gmail app password**, behind a `MailClient` interface |
 | Bot behavior | Replies with the assignment; assigned people are assumed to have worked |
 | Crew size | **2 primary + 1 backup** |
 | Repeat rule | No back-to-back sessions; waived only when the pool is too small, and logged |
@@ -166,8 +166,7 @@ scuba-bot-9000/
 │   ├── db.py                        # connection, schema, forward-only migrations
 │   ├── mail/
 │   │   ├── base.py                  # MailClient protocol (fetch/send/mark)
-│   │   ├── imap_smtp.py             # app-password implementation
-│   │   ├── gmail_api.py             # OAuth implementation
+│   │   ├── imap_smtp.py             # app-password implementation — the one we ship
 │   │   └── fake.py                  # in-memory, for tests
 │   ├── parsing/
 │   │   ├── names.py                 # normalization + alias resolution
@@ -607,24 +606,47 @@ is worse than one that errors.
 
 ---
 
-## Gmail authentication — the comparison you asked for
+## Gmail: IMAP + SMTP with an app password
 
-**IMAP + SMTP with an app password.** One env var (`GMAIL_APP_PASSWORD`). No OAuth flow, no
-refresh token to mount or rotate, nothing that expires while the container runs unattended for
-months. Requires 2FA on the account. Threading works by setting `In-Reply-To`/`References`
-yourself. Full-mailbox access — the credential is coarse.
+**Decided.** One credential (`GMAIL_APP_PASSWORD`), no OAuth flow, no refresh token to mount or
+rotate, and nothing that silently expires while the container runs unattended for months. That last
+point is what settles it: a headless bot nobody looks at until it fails badly should not depend on
+a token that Google can invalidate on a password change or after a stretch of inactivity.
 
-**Gmail API + OAuth.** Needs a Google Cloud project, consent screen, and a refresh token generated
-interactively once then mounted into the container. Scoped access (`gmail.readonly` +
-`gmail.send`), native thread IDs and labels, and a credential revocable from the Google account
-page. The refresh token can be invalidated by password changes or inactivity, which means a
-headless container can wake up broken.
+The cost is that an app password is **coarse** — full mailbox access, not the scoped
+`gmail.readonly` + `gmail.send` an OAuth client would get. It is mitigated by the account being
+single-purpose and dedicated: there is nothing else in that mailbox to lose.
 
-**Recommendation: start with IMAP + SMTP.** For a single-purpose bot on a dedicated account, the
-operational simplicity dominates, and the `MailClient` protocol means switching later touches one
-file. Build `gmail_api.py` only if the account gets shared or audited.
+### Setup
 
-Either way: credentials come from environment variables, never the config file, never the image.
+- **2-Step Verification must be on** — app passwords do not exist without it, and turning 2FA off
+  later revokes every app password, which would take the bot down with an auth error that looks
+  like a wrong password.
+- Generate a 16-character app password and put it in the private repo's Actions secrets as
+  `GMAIL_APP_PASSWORD`. `deploy.yml` renders it into `.env` on the host.
+- `imap.gmail.com:993` over TLS, `smtp.gmail.com:465` over TLS. Read `INBOX`, not All Mail.
+
+### Behaviour worth knowing
+
+- **Threading is manual.** Set `In-Reply-To` and `References` from the message being answered;
+  there are no native thread IDs the way the Gmail API has them. Getting this wrong doesn't error,
+  it just scatters replies out of their threads, so it is worth asserting on in tests.
+- **Gmail files SMTP-sent mail into Sent by itself.** Do not `APPEND` a copy over IMAP as well or
+  every reply appears twice.
+- **Connect per run, not per day.** The container is long-lived but only acts once each morning;
+  holding an IMAP socket open for 24 hours invites half-dead connections that fail in ways a fresh
+  login never would. Connect, do the run, disconnect.
+- Free-account send limits are far above anything this bot does — a handful of replies a week.
+
+### The escape hatch
+
+Everything above sits behind the `MailClient` protocol, and `fake.py` means the tests never touch
+Gmail. If the account is ever shared or audited and scoped credentials become necessary, adding a
+`gmail_api.py` is one new file and a config switch — no changes to parsing, fairness, commands or
+the scheduler.
+
+Credentials come from environment variables. Never the config file, never the image, never a log
+line.
 
 ---
 
@@ -842,6 +864,9 @@ live database on the volume; the dump is the durable copy.
   is named in the reply, which is the only thing that makes the mistake catchable.
 - **Multi-address identity** — the same member sending from a second registered address is
   recognized and authorized.
+- **Threading** — assert a generated reply carries `In-Reply-To` and a `References` chain built
+  from the message it answers. IMAP has no native thread id, so a mistake here does not error, it
+  just scatters replies out of their threads where nobody notices for weeks.
 
 **Year rollover** — it runs once a year, so it will never be debugged in production; the tests are
 the only place it is ever exercised before it matters.
@@ -887,7 +912,8 @@ the only place it is ever exercised before it matters.
    dry-run output should print the chosen block verbatim next to the names it extracted — that
    side-by-side is what makes a parsing bug obvious instead of subtle.
 2. Send a test schedule email to the account, let it reply for real, then exercise `/stats`,
-   `/none`, and `/worked` from an admin address.
+   `/none`, and `/worked` from an admin address. Confirm the reply lands **in the same thread**,
+   and that Gmail's Sent folder holds exactly one copy of it, not two.
 3. Restart the container mid-week and confirm catch-up fires exactly once.
 
 **Privacy**
