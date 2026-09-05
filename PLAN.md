@@ -52,8 +52,10 @@ repo layout*.
 | Member identity | Name + aliases + **email address(es)**; email supplied at `/add-member` |
 | Tie-break | Longest since last worked |
 | Database | SQLite on a mounted volume |
-| Runtime | Long-running container on own server / VPS / NAS |
-| Secrets | Stored in GitHub Secrets, delivered to the host by a deploy workflow |
+| Runtime | Long-running container on the TrueNAS box |
+| Host | TrueNAS, **not reachable from the internet** — it pulls; nothing connects in |
+| Secrets | Hand-written `.env` on the host; **no GitHub Secrets anywhere** |
+| Deployment | Cron on the host: `git pull` the private repo, `docker compose pull && up -d` |
 | Backup | SQLite snapshot committed to the **private** data repo after each run |
 | Year rollover | On the first assignment of a new year: assign → reply → summary email → purge → reset snapshots |
 | Data retention | Current year only, in the live database *and* in the snapshots |
@@ -80,20 +82,20 @@ stops being cheap the moment the first roster lands in a commit.
 
 | | `scuba-bot-9000` (public) | `scuba-bot-9000-data` (private) |
 |---|---|---|
-| Holds | Code, tests, Dockerfile, compose, CI, `config.example.yaml` with invented people | `roster.yaml`, real email fixtures, `snapshots/`, `deploy.yml` |
-| Secrets in its Actions | **none** | all of them |
+| Holds | Code, tests, Dockerfile, compose, CI, `config.example.yaml` with invented people | `roster.yaml`, real email fixtures, `snapshots/` |
+| Secrets in its Actions | **none** | **none** — the host holds them, see *Deployment* |
 | Change rate | Often | Rarely — a few roster edits a year |
 
-**The deploy workflow lives in the private repo.** This is the load-bearing decision, not a
-tidiness preference. A public repo whose Actions hold deploy credentials is a standing risk:
-workflow changes arriving by PR, `pull_request_target` misconfiguration, and fork-triggered runs
-are a well-worn path to exfiltrating secrets. With every secret on the private side, the public
-repo's CI runs `pytest`/`ruff`/`mypy` over untrusted input with nothing available to steal.
+**Neither repo holds a secret.** Because the host is unreachable and pulls for itself (see
+*Deployment*), there is no deploy workflow and therefore no deploy credential anywhere on GitHub.
+That removes an entire risk class rather than managing it: no `pull_request_target` footgun, no
+fork-triggered job with something worth stealing, no PAT to rotate. The split between the two repos
+is justified by **personal data alone**, which is a simpler thing to keep true.
 
-**No automatic cross-repo trigger.** Having the public repo poke the private one on merge requires
-a PAT stored on the public side — reintroducing exactly the credential the split removes.
-`deploy.yml` runs on `workflow_dispatch` plus a nightly schedule that redeploys only when the GHCR
-image digest changed. For a bot that ships a few times a year, that is enough.
+**Do not attach a self-hosted runner to the public repo.** A runner would be the one way to put
+secrets back in play, and GitHub's own guidance is that self-hosted runners do not belong on public
+repositories — a pull request from a fork can run arbitrary code on the machine. If one is ever
+added, it goes on the private repo and nowhere else.
 
 ### What lives where
 
@@ -184,8 +186,10 @@ scuba-bot-9000-data/
 ├── roster.yaml                      # real names, aliases, emails, admins
 ├── fixtures/                        # real schedule emails, for `pytest -m realdata`
 ├── snapshots/                       # nightly sqlite3 .dump
-└── .github/workflows/deploy.yml     # the only workflow holding secrets
+└── .github/workflows/roster-check.yml   # validates roster.yaml; no secrets
 ```
+
+The host clones this repo and pulls it on a schedule; nothing is pushed to the host.
 
 **Layering rule:** `fairness.py` and `parsing/` are pure functions over plain data — no DB, no
 network. That is what makes the year-long simulation test cheap to write.
@@ -615,11 +619,15 @@ Either way: credentials come from environment variables, never the config file, 
 ## Docker & operations
 
 - `python:3.12-slim`, non-root user, no build toolchain in the final layer.
-- Volumes: `./data:/data` (SQLite — **primary storage**), `./config:/config:ro` (tuning +
-  `roster.yaml`, both delivered by deploy, neither in the public repo).
+- Volumes, all on a TrueNAS **pool dataset** so they survive an OS upgrade:
+  `data:/data` (SQLite — **primary storage**), `config:/config:ro` (tuning + `roster.yaml` from the
+  private-repo checkout), and the snapshot deploy key mounted read-only.
 - Long-running container, `restart: unless-stopped`, APScheduler cron trigger at 08:00
   `America/Los_Angeles`. Running on your own host is what makes this correct: the scheduler reads
-  a real timezone, so 8am stays 8am across the PST/PDT switch with no manual cron edits.
+  a real timezone, so 8am stays 8am across the PST/PDT switch with no manual cron edits. Set `TZ`
+  explicitly in compose rather than trusting the NAS default.
+- **Outbound-only.** The container needs IMAP/SMTP to Gmail, HTTPS to GHCR and to GitHub for the
+  snapshot push. Nothing listens; no ports are published.
 - CLI escape hatches: `run --once`, `run --dry-run`, `stats`, `db upgrade`, `db backup`.
 - Logs to stdout as structured JSON; Docker handles rotation. **Redacted:** member ids and
   canonical names may appear, full email addresses and raw message bodies never do.
@@ -636,32 +644,71 @@ GitHub Secrets are only decryptable inside GitHub Actions. A container on your o
 read them at runtime. So secrets have to be *pushed* to the host, and GitHub stays the source of
 truth rather than the delivery mechanism.
 
-### Which workflow lives in which repo
+### Workflows
 
 | Workflow | Repo | Trigger | Does | Secrets |
 |---|---|---|---|---|
 | `ci.yml` | public | PR + push | `pytest`, `ruff`, `mypy`, `gitleaks`, PII check | **none** |
 | `publish.yml` | public | push to `main` | Build image, push to GHCR | built-in `GITHUB_TOKEN` |
-| `deploy.yml` | **private** | `workflow_dispatch` + nightly | SSH to host, render `/opt/scubabot/.env`, copy `roster.yaml`, `docker compose pull && up -d` | all of them |
+| `roster-check.yml` | private | PR + push | `roster.yaml` parses, required fields present, no duplicate emails or aliases | **none** |
 
-**Private repo secrets:** `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, `BOOTSTRAP_ADMIN_EMAILS`,
-`DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `SNAPSHOT_DEPLOY_KEY`.
-**Public repo secrets: none at all** — `publish.yml` needs only the token GitHub injects itself.
+**No GitHub Secrets are used anywhere.** This is a change from the original intent of managing
+secrets through GitHub Secrets, and it follows directly from the host being unreachable: a secret
+in GitHub Secrets can only be decrypted inside an Actions runner, and there is no API to read one
+from outside. Delivering it to the host therefore requires either something that can *reach* the
+host, or a runner *on* the host. Neither applies here, so the secrets live on the host and GitHub
+holds none.
+
+### Deployment — the host pulls
+
+The host is a **TrueNAS box with no inbound reachability**, so nothing connects to it; it fetches
+on a schedule.
+
+A small `update.sh`, stored on a pool dataset and scheduled through the TrueNAS UI
+(*Data Protection → Cron Jobs*, so the schedule lives in the TrueNAS config and survives an
+upgrade):
+
+1. `git -C <dataset>/data pull --ff-only` — picks up `roster.yaml` changes.
+2. `docker compose pull` — fetches the newest published image.
+3. `docker compose up -d` — no-op unless the image digest or compose file actually changed.
+
+**Everything must live on a pool dataset**, not on the boot device: the compose file, `.env`,
+`update.sh`, the SQLite volume and the private-repo checkout. TrueNAS treats the system dataset as
+disposable across upgrades, so anything left in `/usr/local` or `/etc/cron.d` can vanish on an
+update — which would silently stop the bot rather than fail loudly.
+
+**Assumes TrueNAS SCALE** (Linux, Docker). TrueNAS CORE is FreeBSD and has no Docker; there the bot
+would need a Linux VM, which changes only this section.
+
+### Secrets on the host
+
+`/mnt/<pool>/apps/scubabot/.env`, written by hand once, `chmod 600`, owned by root:
+
+```
+GMAIL_ADDRESS=...
+GMAIL_APP_PASSWORD=...
+BOOTSTRAP_ADMIN_EMAILS=...
+```
+
+It is read by the Docker CLI at `up` time via `env_file:`, not by the container, so it does **not**
+need to be readable by the container's user. The snapshot deploy key is different: it is mounted
+into the container, so it lives beside `.env` as `0400` owned by the container's uid, read-only.
 
 `BOOTSTRAP_ADMIN_EMAILS` solves the chicken-and-egg problem: on an empty database nobody can run
 `/add-member`, because there is no member to authorize. Those addresses are always treated as
 admins regardless of roster state — which also makes them the recovery path if the last admin is
 ever removed by accident.
 
-`deploy.yml` is what keeps GitHub the single source of truth: rotating the Gmail password means
-editing one secret and re-running deploy — never touching the NAS by hand.
+Secrets never enter the image, the config YAML, a repo, or a log line. **Rotating the Gmail app
+password means editing `.env` on the NAS and restarting the container** — the cost of the host
+being unreachable, and the reason to note where that file lives while it is still fresh.
 
-**If the host isn't reachable from the internet** (likely for a NAS behind NAT), invert it: the
-host pulls the private repo on a schedule and reads `roster.yaml` and `.env` from the checkout.
-Decide this once the host is known — it changes `deploy.yml` and nothing else.
+### Making staleness visible
 
-On the host, `.env` is `chmod 600`, owned by the service user, and passed via `env_file:` in
-compose. Secrets never enter the image, the config YAML, or a log line.
+Nothing pushes to this host, so a broken cron job looks exactly like a working one: the bot keeps
+running yesterday's image against yesterday's roster forever. The bot therefore logs its **image
+digest and the private repo's commit SHA at startup**, and `/stats` reports both. That turns a
+silent stall into something a human can notice.
 
 ### Backup to the private data repo
 
@@ -677,8 +724,9 @@ live database on the volume; the dump is the durable copy.
   latest dump. Deleting the files is not enough — git keeps old commits, so a `git rm` would leave
   every purged year sitting in the repo forever and make the purge cosmetic. Recovery never wants
   a snapshot from last March anyway; restoring one would reintroduce stale counts.
-- Auth via `SNAPSHOT_DEPLOY_KEY`, a write-scoped deploy key for the private repo only, mounted
-  read-only into the container. It must not grant access to the public repo.
+- Auth via a write-scoped deploy key for the private repo only, mounted read-only into the
+  container. It must not grant access to the public repo. The push is outbound HTTPS, so it works
+  from behind NAT exactly as everything else here does.
 - Commit only when the dump actually changed, so quiet weeks generate no noise.
 - `db restore <file>` CLI command, and **test it** — an untested backup is not a backup.
 - `db export-roster` regenerates `roster.yaml` from the live DB; commit it whenever the roster
@@ -706,7 +754,7 @@ live database on the volume; the dump is the durable copy.
 5. **Docker, scheduler, catch-up, structured logging with redaction.**
    Includes the **year rollover** — summary email, purge, snapshot reset — which is easiest to get
    right while it can still be tested against a throwaway database.
-6. **CI, image publishing, deploy workflow, DB snapshot + restore.**
+6. **CI, image publishing, the host-side pull script, DB snapshot + restore.**
 7. **Dry-run soak**, then enable sending.
 
 ---
@@ -821,14 +869,19 @@ the only place it is ever exercised before it matters.
 - **Standing sweep** — the repo is already public, so this is periodic rather than a one-time gate:
   run the PII check over `git log --all -p`, and confirm no `snapshots/`, `roster.yaml` or real
   email body has reached this repo on any branch.
-- **Snapshot key scope** — confirm `SNAPSHOT_DEPLOY_KEY` can push to the private repo and *cannot*
-  reach the public one.
+- **Snapshot key scope** — confirm the snapshot deploy key can push to the private repo and
+  *cannot* reach the public one.
 
 **Deploy & backup**
-- Run `deploy.yml` against the host; confirm `.env` lands with `600` perms and the container comes
-  up on the new image.
-- Grep the container logs and the Actions run log for the Gmail password — it must appear in
-  neither.
+- Run `update.sh` by hand on the NAS; confirm it pulls the private repo, pulls the image, and
+  restarts only when something actually changed.
+- Reboot the NAS and confirm the container comes back and the cron job still exists — this is the
+  TrueNAS upgrade/reset failure mode, caught cheaply.
+- Confirm `.env` is `600` and root-owned, and that the container still starts without being able to
+  read it directly.
+- Grep the container logs for the Gmail password — it must not appear.
+- **Staleness check:** stop the cron job, publish a new image, and confirm `/stats` still reports
+  the old digest, so a stalled host is detectable rather than invisible.
 - **Restore drill:** take a snapshot, delete the live `.db`, run `db restore`, and confirm
   `/stats` returns identical numbers. Do this before the bot has a year of history worth losing.
 - **Rebuild-from-recipe drill:** with no snapshot at all, boot an empty DB against `roster.yaml`
