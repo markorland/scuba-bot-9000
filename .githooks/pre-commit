@@ -1,0 +1,8 @@
+#!/bin/sh
+# Blocks personal data before it becomes a commit.
+#
+# Enable with:  git config core.hooksPath .githooks
+#
+# This is the cheap half of the guardrail. CI runs the same check over the whole
+# tree, because a hook only protects the machine that has it enabled.
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_pii.py" --staged

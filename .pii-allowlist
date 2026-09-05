@@ -1,0 +1,7 @@
+# Addresses or bare domains that are allowed in this public repo.
+# One per line. Reserved documentation domains (example.com/.net/.org and the
+# .test/.example/.invalid/.localhost suffixes) are always allowed and need no
+# entry here.
+noreply@github.com
+noreply@anthropic.com
+users.noreply.github.com
