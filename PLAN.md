@@ -24,7 +24,9 @@ command (`/none`, `/worked ...`), and manage the roster the same way.
 
 Members have email addresses on file, which is what lets the bot tell who is speaking.
 
-Counts reset every January 1st. Medical leave must not push someone to the front of the queue when
+Counts reset every January. On the first shift of the new year the bot assigns as usual, emails a
+summary of the closing year, and then **deletes it** — nothing is kept beyond the current year, in
+the database or in the backups. Medical leave must not push someone to the front of the queue when
 they return — time on leave is invisible to the fairness math, not a debt to repay.
 
 The repo holds only `README.md`, `LICENSE` and `.gitignore`, so this is greenfield — and **it is
@@ -53,6 +55,9 @@ repo layout*.
 | Runtime | Long-running container on own server / VPS / NAS |
 | Secrets | Stored in GitHub Secrets, delivered to the host by a deploy workflow |
 | Backup | SQLite snapshot committed to the **private** data repo after each run |
+| Year rollover | On the first assignment of a new year: assign → reply → summary email → purge → reset snapshots |
+| Data retention | Current year only, in the live database *and* in the snapshots |
+| Year summary | Its own email, `Steelhead <year> — year in review`; the only surviving record |
 | Repo layout | Public `scuba-bot-9000` (code) + private `scuba-bot-9000-data` (roster, fixtures, snapshots, deploy) |
 | Roster storage | `roster.yaml` in the private repo; seeds SQLite on first boot, DB authoritative after |
 | PII in the public repo | None — no names, no addresses, no real email bodies, no `.db` files |
@@ -202,7 +207,9 @@ PST/PDT switch.
 4. **Command reply** → authorize sender → execute → reply with the result.
 5. **Finalize** any assignment whose Sunday has passed by more than `finalize_grace_days`
    (default 1) and that was not corrected: write a `sessions` row per primary, status → `confirmed`.
-6. **Record** the run.
+6. **Roll over the year** if this run produced the first assignment of a new calendar year — see
+   *Yearly rollover*.
+7. **Record** the run.
 
 Credit is awarded at *finalization*, not at assignment time, so `/none` and `/worked` have a
 window to land first. Ranking counts confirmed **plus** still-pending assignments, so nobody gets
@@ -415,10 +422,59 @@ backup first, and say so plainly in the reply. Zero eligible → reply asking a 
 write no assignment. A roster small enough to force weekly cooldown waivers is a staffing problem
 the bot should surface, not paper over.
 
-### Yearly reset
+### Yearly rollover
 
-Nothing is deleted. Every fairness query filters `WHERE year = ?`, so counters reset on their own
-at midnight Jan 1. `/stats 2025` can still read prior years.
+Every fairness query filters `WHERE year = ?`, so counters reset on their own at midnight Jan 1.
+The rollover is what makes the reset real: it reports the closing year, then deletes it.
+
+It is triggered by the **first assignment of a new year, not by the calendar**. If the bot is down
+on Jan 1, or the first schedule email lands on the 8th, the rollover still happens exactly once and
+still happens in the right order.
+
+**The order is load-bearing:**
+
+1. **Finalize** any assignment left pending from the closing year, so December's credit is complete
+   before anything is counted or deleted.
+2. **Assign** the new year's first Sunday as normal. The closing year's `sessions` are still present
+   at this point, which is exactly what lets the back-to-back cooldown see that someone worked on
+   Dec 28. Purging first would let that person be assigned again a week later — the one rule a
+   rollover could quietly break, and nobody would notice until it had happened.
+3. **Send the assignment reply.**
+4. **Send the year-in-review summary** as its own email: `Steelhead <closing year> — year in review`.
+5. **Confirm both sends succeeded.** If either failed, stop and retry next run. After step 6 the
+   summary is the *only* surviving record of the year; purging before it is delivered destroys the
+   data and produces nothing in exchange.
+6. **Purge** the closing year and everything before it.
+7. **Reset the snapshot branch** so the backups hold no more than the live database does.
+8. **Record** the rollover in `year_rollovers`, which is what stops it running twice.
+
+**The summary email** — per member: sessions worked, load ratio, longest gap between sessions. Plus
+totals: Sundays covered, assignments voided by `/none`, corrections via `/worked`, cooldown waivers,
+and members who joined or left. Anyone who wants a longer record keeps the email.
+
+**Purged:** `sessions`, `schedules` and `schedule_attendees`, `assignments` and `assignment_slots`,
+`unmatched_names`, `command_log`, `runs` — everything dated before Jan 1 of the current year.
+Dropping `schedules` also removes every stored `raw_body`, so the most sensitive thing the bot holds
+has a one-year life by default rather than accumulating forever.
+
+**Survives the purge:**
+
+- `members`, `member_aliases`, `member_emails` — the roster is not history.
+- `leaves` that are open-ended or that end on or after Jan 1. **A member on medical leave across the
+  boundary must stay on leave**; deleting their row would silently make them eligible on their first
+  Sunday back, which is precisely the outcome the leave rule exists to prevent.
+- `processed_messages`, on its own rolling window (`processed_message_retention_days`, default 400).
+  It holds Message-IDs and nothing else, and it is the only thing stopping a re-fetched December
+  email from being answered a second time. Tying it to the year purge would trade a real
+  duplicate-reply risk for no privacy gain.
+- `year_rollovers` — one row per year, dates only.
+
+**A consequence worth deciding on now.** On Jan 1 every member has zero sessions, so ranking falls
+through load ratio, raw count *and* days-since-last-session to the final tiebreak: canonical name.
+January would be assigned alphabetically. The fix is one denormalized `members.last_session_date`
+that survives the purge — a single date per member, no session history — so January ordering still
+reflects who has actually waited longest. Recommended; drop the column if a literal clean slate
+matters more than fairness in the first few weeks.
 
 ### Name matching
 
@@ -435,7 +491,9 @@ an admin can add an alias if the bot guessed wrong. **The bot never assigns a na
 ## Database (SQLite)
 
 ```
-members(id, canonical_name, active, is_admin, added_at, removed_at)
+members(id, canonical_name, active, is_admin, added_at, removed_at, last_session_date)
+    -- last_session_date is denormalized and survives the yearly purge, so January
+    -- ranking still breaks ties by who has waited longest rather than alphabetically
 member_aliases(member_id, alias_normalized UNIQUE)
 member_emails(member_id, email_normalized UNIQUE, is_primary)
     -- multiple rows per member: people reply from a phone or work address
@@ -456,10 +514,16 @@ processed_messages(message_id PK, processed_at, kind)
 command_log(id, message_id, sender, command, args, result, created_at)
 unmatched_names(id, raw_name, first_seen, times_seen)
 runs(id, run_date UNIQUE, started_at, finished_at, status, summary)
+year_rollovers(closing_year PK, summary_sent_at, purged_at, snapshots_reset_at)
+    -- dates only, no names; makes the rollover idempotent. summary_sent_at is written
+    -- before purged_at, so a crash between them is visible and recoverable
 ```
 
 `sessions` is the single credit ledger — all stats read from it. `eligible_sundays` is derived
 from `schedule_attendees` minus `leaves`, never stored as a counter that can drift.
+
+Every table that accumulates rows is emptied of prior years at rollover, so the database stays
+roughly constant in size year over year rather than growing forever.
 
 Enable `PRAGMA journal_mode=WAL` and `foreign_keys=ON`.
 
@@ -485,7 +549,7 @@ Two privilege levels, both derived from the roster rather than a separate list:
 | `/add-member <name> <email> [alias, ...]` | Add to roster with a contact address |
 | `/add-email <name> <email>` | Register an additional address for an existing member |
 | `/remove-member <name>` | Soft-delete; history and past sessions preserved |
-| `/stats [year]` | Sessions, load ratio, last worked, current leave — per member |
+| `/stats` | Sessions, load ratio, last worked, current leave — per member, current year |
 | `/leave-start <name> [YYYY-MM-DD]` | Begin medical leave (defaults to today) |
 | `/leave-end <name> [YYYY-MM-DD]` | End medical leave |
 | `/none [YYYY-MM-DD]` | Nobody cleaned steelhead — void the assignment, credit no one |
@@ -579,6 +643,11 @@ live database on the volume; the dump is the durable copy.
 
 - Push to `snapshots/` in **`scuba-bot-9000-data`**, on its own branch so nightly commits never
   clutter that repo's history either.
+- **Current year only.** At rollover, after the summary email is sent and the first assignment of
+  the new year is made, the branch is replaced with a **fresh orphan branch** holding just the
+  latest dump. Deleting the files is not enough — git keeps old commits, so a `git rm` would leave
+  every purged year sitting in the repo forever and make the purge cosmetic. Recovery never wants
+  a snapshot from last March anyway; restoring one would reintroduce stale counts.
 - Auth via `SNAPSHOT_DEPLOY_KEY`, a write-scoped deploy key for the private repo only, mounted
   read-only into the container. It must not grant access to the public repo.
 - Commit only when the dump actually changed, so quiet weeks generate no noise.
@@ -606,6 +675,8 @@ live database on the volume; the dump is the durable copy.
    messages are what turn them into a spec. The public suite gets synthetic equivalents.
 4. **Command parsing and handlers** — including auth and quoted-text stripping.
 5. **Docker, scheduler, catch-up, structured logging with redaction.**
+   Includes the **year rollover** — summary email, purge, snapshot reset — which is easiest to get
+   right while it can still be tested against a throwaway database.
 6. **CI, image publishing, deploy workflow, DB snapshot + restore.**
 7. **Dry-run soak**, then enable sending.
 
@@ -662,6 +733,29 @@ live database on the volume; the dump is the durable copy.
   is named in the reply, which is the only thing that makes the mistake catchable.
 - **Multi-address identity** — the same member sending from a second registered address is
   recognized and authorized.
+
+**Year rollover** — it runs once a year, so it will never be debugged in production; the tests are
+the only place it is ever exercised before it matters.
+- **Order** — simulate a December session followed by the first Sunday of January. Assert whoever
+  worked in late December is **not** assigned on the first shift of the new year, proving the
+  cooldown saw last year's data because the assignment ran before the purge.
+- **Idempotency** — run the rollover twice. Assert exactly one summary email, one purge, one
+  `year_rollovers` row.
+- **Failed send blocks the purge** — make the summary send fail. Assert nothing is deleted, no
+  `year_rollovers` row is written, and the next run retries and succeeds. This is the test that
+  keeps a mail outage from turning into permanent data loss.
+- **Purge scope** — assert prior-year sessions, schedules, assignments, unmatched names, command log
+  and runs are gone, while members, aliases and emails are untouched.
+- **Leave across the boundary** — a member with an open-ended leave, and one whose leave ends in
+  March, both survive the purge and stay ineligible afterwards.
+- **`processed_messages` retention** — assert rows inside the rolling window survive the purge, and
+  that re-feeding a December email after rollover produces no second reply.
+- **`last_session_date` survives**, so the first January ranking orders by longest wait rather than
+  alphabetically.
+- **Summary content** — assert the emailed totals match the database as it stood immediately before
+  the purge, per member and in aggregate.
+- **Snapshot reset** — assert the snapshots branch afterwards has a single commit whose history
+  contains no dump from a prior year.
 
 **Integration (fake mail client)**
 - Schedule email → correct 2+1 reply body, guests excluded, unmatched names logged and named in
