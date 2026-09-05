@@ -39,6 +39,7 @@ repo layout*.
 |---|---|
 | Command surface | Slash commands typed into **email replies** (real Slack/Discord deferred) |
 | Gmail auth | **IMAP + SMTP with a Gmail app password**, behind a `MailClient` interface |
+| Send modes | `dry-run` → `dark` (everything real, all mail to one address) → `live` |
 | Bot behavior | Replies with the assignment; assigned people are assumed to have worked |
 | Crew size | **2 primary + 1 backup** |
 | Repeat rule | No back-to-back sessions; waived only when the pool is too small, and logged |
@@ -650,6 +651,65 @@ line.
 
 ---
 
+## Send modes
+
+Three modes, meant to be walked through in order. `mail.mode` in config, overridable with
+`SCUBABOT_MAIL_MODE`:
+
+| Mode | Parses & ranks | Writes to the DB | Sends | To whom |
+|---|---|---|---|---|
+| `dry-run` | yes | **no** | **no** | — renders the reply to stdout |
+| `dark` | yes | **yes** | yes | **one address only** |
+| `live` | yes | yes | yes | the thread's real recipients |
+
+**`dark` is the useful one and the point of this section.** The bot does everything for real —
+parses the incoming schedule, ranks, picks the crew, writes the assignment, finalizes credit the
+next day — but every outbound message goes to a single address instead of the team. It is the only
+way to find out whether the assignments are *right* on real emails, rather than whether the code
+runs, and it does that without anyone on the team receiving a word from a bot that is still being
+trusted.
+
+Everything outbound redirects: assignment replies, command confirmations, the year-in-review
+summary, and any "a human needs to look at this" message. A `/none` confirmation escaping to the
+team would be exactly as confusing as an assignment escaping to them.
+
+### What a dark message looks like
+
+- Subject gets a `[DARK]` prefix, so a redirected message can never be mistaken for a real one.
+- The body opens with a banner naming **who this would have gone to**, and the assignment follows
+  unchanged. Without that, a dark soak tells you the bot sent *something* but not to whom — which
+  is half the thing being tested.
+- `X-Scubabot-Original-To` carries the same list as a header, for filtering.
+- `In-Reply-To`/`References` are still set as they would be live, so threading behaviour is under
+  test too rather than being skipped.
+
+### Fail closed
+
+If the mode is `dark` and no recipient is configured, the bot **refuses to send at all** and logs
+an error. It must never quietly fall back to live: the whole reason dark mode exists is that the
+team should not hear from the bot yet, and a fallback would break that in exactly the situation
+where nobody is watching.
+
+The recipient comes from the environment (`DARK_RECIPIENT`), not from config, because it is a real
+email address and committed config in this repo holds no real addresses.
+
+### The mode must be obvious
+
+The opposite mistake — sitting in `dark` while believing you are live — is quieter and worse: the
+team simply never gets assignments and nobody thinks to ask why a bot they have never seen has
+gone silent. So the mode is logged at startup, reported by `/stats`, and stated in the banner of
+every dark message.
+
+### Dark writes to the real database, deliberately
+
+A dark soak on real schedule emails produces real, correct state, so going live is a config flip
+with the year's counts already accumulated and continuous. The cost is that a soak which produced
+*wrong* assignments has also recorded them — fix those with `/worked`, or start live from a clean
+database. That is a better trade than soaking against a throwaway database and then going live with
+no history at all.
+
+---
+
 ## Docker & operations
 
 - `python:3.12-slim`, non-root user, no build toolchain in the final layer.
@@ -665,8 +725,8 @@ line.
 - CLI escape hatches: `run --once`, `run --dry-run`, `stats`, `db upgrade`, `db backup`.
 - Logs to stdout as structured JSON; Docker handles rotation. **Redacted:** member ids and
   canonical names may appear, full email addresses and raw message bodies never do.
-- `--dry-run` parses, ranks, and renders the reply **without sending or writing**. Run the first
-  two or three weeks this way before letting it send.
+- `run --once` and `run --dry-run` for manual invocation; `--dry-run` forces `dry-run` mode
+  regardless of config, so it is always safe to run by hand against the live mailbox.
 
 ---
 
@@ -806,7 +866,9 @@ live database on the volume; the dump is the durable copy.
    Includes the **year rollover** — summary email, purge, snapshot reset — which is easiest to get
    right while it can still be tested against a throwaway database.
 6. **CI, image publishing, the self-hosted runner, `deploy.yml`, DB snapshot + restore.**
-7. **Dry-run soak**, then enable sending.
+7. **Soak: `dry-run` for a week, then `dark` for two or three real Sundays, then `live`.** Dark is
+   where the assignments get checked against what a human would have chosen, on real emails, with
+   nobody on the team receiving anything.
 
 ---
 
@@ -915,6 +977,19 @@ the only place it is ever exercised before it matters.
    `/none`, and `/worked` from an admin address. Confirm the reply lands **in the same thread**,
    and that Gmail's Sent folder holds exactly one copy of it, not two.
 3. Restart the container mid-week and confirm catch-up fires exactly once.
+
+**Send modes**
+- **Dark redirects everything** — drive a full cycle (schedule email, a command reply, a rollover
+  summary) in `dark` and assert every outbound message went to the dark recipient and **no member
+  address appears in any `To` or `Cc`**.
+- **The banner is accurate** — assert it names the recipients the message would have had live.
+- **Dark still writes** — assert the assignment, slots and finalized session rows are identical to
+  what `live` would have produced.
+- **Fail closed** — set `dark` with no `DARK_RECIPIENT` and assert the bot sends nothing and logs
+  an error, rather than falling back to live.
+- **Dry-run writes nothing** — assert no rows change and no mail is sent, even for a schedule email
+  that would otherwise create an assignment.
+- **Mode is visible** — assert `/stats` reports the current mode.
 
 **Privacy**
 - **PII check, tested both ways** — assert the CI job fails on a commit containing an email-shaped
