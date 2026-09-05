@@ -58,6 +58,7 @@ repo layout*.
 | Year rollover | On the first assignment of a new year: assign → reply → summary email → purge → reset snapshots |
 | Data retention | Current year only, in the live database *and* in the snapshots |
 | Year summary | Its own email, `Steelhead <year> — year in review`; the only surviving record |
+| First shift of January | Goes to whoever cleaned least in the closing year, via a carried-over ratio |
 | Repo layout | Public `scuba-bot-9000` (code) + private `scuba-bot-9000-data` (roster, fixtures, snapshots, deploy) |
 | Roster storage | `roster.yaml` in the private repo; seeds SQLite on first boot, DB authoritative after |
 | PII in the public repo | None — no names, no addresses, no real email bodies, no `.db` files |
@@ -403,10 +404,18 @@ Sort ascending by:
 
 1. **Load ratio** — `sessions_this_year / eligible_sundays_this_year`
 2. Raw session count this year
-3. Days since last steelhead session (descending — longest wait first)
-4. Canonical name (deterministic final tie-break)
+3. **Closing year's load ratio** — `members.prior_year_ratio`, carried across the rollover
+4. Days since last steelhead session (descending — longest wait first)
+5. Canonical name (deterministic final tie-break)
 
 Top 2 → primary, next 1 → backup.
+
+Key 3 exists for January. Once the year rolls over, keys 1 and 2 are zero for everybody and would
+decide nothing; the closing year's ratio is then the only real information available, so **the first
+shift of the new year goes to the people who cleaned least last year**. It fades out on its own as
+new sessions accumulate and the first two keys start separating people again. A member with no prior
+year (someone who joined in December) ranks as though their prior ratio were zero — they have done
+nothing, so they go first.
 
 **Why a ratio rather than a raw count.** A raw count is what "the people who worked the least go
 first" means intuitively, and when everyone attends similarly the ratio reduces to exactly that.
@@ -435,18 +444,23 @@ still happens in the right order.
 
 1. **Finalize** any assignment left pending from the closing year, so December's credit is complete
    before anything is counted or deleted.
-2. **Assign** the new year's first Sunday as normal. The closing year's `sessions` are still present
-   at this point, which is exactly what lets the back-to-back cooldown see that someone worked on
-   Dec 28. Purging first would let that person be assigned again a week later — the one rule a
-   rollover could quietly break, and nobody would notice until it had happened.
-3. **Send the assignment reply.**
-4. **Send the year-in-review summary** as its own email: `Steelhead <closing year> — year in review`.
-5. **Confirm both sends succeeded.** If either failed, stop and retry next run. After step 6 the
+2. **Write the carry-over values** — `prior_year_ratio` and `last_session_date` per member,
+   computed from the closing year. This has to happen *before* the assignment in step 3, because
+   that assignment ranks on `prior_year_ratio`; write it later and the first shift of the year would
+   rank on values a year out of date.
+3. **Assign** the new year's first Sunday. Ranking keys 1 and 2 are zero for everyone, so key 3
+   decides: the people who cleaned least last year. The closing year's `sessions` are also still
+   present, which is what lets the back-to-back cooldown see that someone worked on Dec 28. Purging
+   first would let that person be assigned again a week later — the one rule a rollover could
+   quietly break, and nobody would notice until it already had.
+4. **Send the assignment reply.**
+5. **Send the year-in-review summary** as its own email: `Steelhead <closing year> — year in review`.
+6. **Confirm both sends succeeded.** If either failed, stop and retry next run. After step 7 the
    summary is the *only* surviving record of the year; purging before it is delivered destroys the
    data and produces nothing in exchange.
-6. **Purge** the closing year and everything before it.
-7. **Reset the snapshot branch** so the backups hold no more than the live database does.
-8. **Record** the rollover in `year_rollovers`, which is what stops it running twice.
+7. **Purge** the closing year and everything before it.
+8. **Reset the snapshot branch** so the backups hold no more than the live database does.
+9. **Record** the rollover in `year_rollovers`, which is what stops it running twice.
 
 **The summary email** — per member: sessions worked, load ratio, longest gap between sessions. Plus
 totals: Sundays covered, assignments voided by `/none`, corrections via `/worked`, cooldown waivers,
@@ -468,13 +482,26 @@ has a one-year life by default rather than accumulating forever.
   email from being answered a second time. Tying it to the year purge would trade a real
   duplicate-reply risk for no privacy gain.
 - `year_rollovers` — one row per year, dates only.
+- `members.prior_year_ratio` and `members.last_session_date` — two scalars per member, written in
+  step 2, before either the assignment or the delete needs them.
 
-**A consequence worth deciding on now.** On Jan 1 every member has zero sessions, so ranking falls
-through load ratio, raw count *and* days-since-last-session to the final tiebreak: canonical name.
-January would be assigned alphabetically. The fix is one denormalized `members.last_session_date`
-that survives the purge — a single date per member, no session history — so January ordering still
-reflects who has actually waited longest. Recommended; drop the column if a literal clean slate
-matters more than fairness in the first few weeks.
+**Who goes first in January.** On Jan 1 every member has zero sessions in the new year, so the
+first two ranking keys tie for everyone. The key that decides the first shift is the closing year's
+load ratio, written to `members.prior_year_ratio` in step 2 and surviving the purge: **the
+people who cleaned least last year go first.** That is the same rule that governs every other week
+of the year, applied to the only data that still exists.
+
+Two scalars per member survive the purge to make this work — `prior_year_ratio` and
+`last_session_date`. Neither is history in any meaningful sense: no sessions, no schedules, no email
+bodies, nothing beyond what the roster already implies.
+
+**Carrying a ratio rather than a date is the whole point.** If January ordering fell back to
+`last_session_date` alone, a member returning from three months of leave would have the oldest date
+on the roster and be picked first every week until new-year sessions accumulated — precisely the
+catch-up penalty the load ratio exists to prevent. Carrying the ratio carries leave-invisibility
+across the year boundary with it. `last_session_date` is kept for a narrower job: honouring the
+back-to-back cooldown when the previous session has been purged, such as a `/none` on the first
+shift of the new year.
 
 ### Name matching
 
@@ -491,9 +518,11 @@ an admin can add an alias if the bot guessed wrong. **The bot never assigns a na
 ## Database (SQLite)
 
 ```
-members(id, canonical_name, active, is_admin, added_at, removed_at, last_session_date)
-    -- last_session_date is denormalized and survives the yearly purge, so January
-    -- ranking still breaks ties by who has waited longest rather than alphabetically
+members(id, canonical_name, active, is_admin, added_at, removed_at,
+        last_session_date, prior_year_ratio)
+    -- both survive the yearly purge and are rewritten at each rollover.
+    -- prior_year_ratio ranks the first shift of January (fewest cleanings last year go
+    -- first); last_session_date honours the cooldown when the previous session is gone
 member_aliases(member_id, alias_normalized UNIQUE)
 member_emails(member_id, email_normalized UNIQUE, is_primary)
     -- multiple rows per member: people reply from a phone or work address
@@ -750,8 +779,16 @@ the only place it is ever exercised before it matters.
   March, both survive the purge and stay ineligible afterwards.
 - **`processed_messages` retention** — assert rows inside the rolling window survive the purge, and
   that re-feeding a December email after rollover produces no second reply.
-- **`last_session_date` survives**, so the first January ranking orders by longest wait rather than
-  alphabetically.
+- **First shift of January** — give members different session counts across the closing year, then
+  roll over. Assert the two assigned on the first Sunday are the two who cleaned *least* last year,
+  and that the ordering came from `prior_year_ratio` rather than from names.
+- **Leave does not distort January** — a member on leave for the last quarter of the closing year is
+  **not** pushed to the front in January. This is the test that proves a ratio was carried rather
+  than a date; carrying `last_session_date` alone would fail it.
+- **Carry-over is written before the assignment**, not after: assert the first January assignment
+  used the closing year's numbers, not the previous rollover's stale ones.
+- **A member who joined in December** ranks as prior ratio zero and is assigned early rather than
+  sorted last.
 - **Summary content** — assert the emailed totals match the database as it stood immediately before
   the purge, per member and in aggregate.
 - **Snapshot reset** — assert the snapshots branch afterwards has a single commit whose history
