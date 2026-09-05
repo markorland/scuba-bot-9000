@@ -156,8 +156,8 @@ def main() -> int:
         # is for is file content and commit messages. Scanning the headers would
         # only tempt someone into writing a real address into .pii-allowlist,
         # which is a public file, to silence it.
-        text = git("log", "--all", "-p", "--no-color", "--format=%H%n%B")
-        for lineno, masked in scan_text(text, allowlist):
+        log = git("log", "--all", "-p", "--no-color", "--format=%H%n%B")
+        for lineno, masked in scan_text(log, allowlist):
             problems.append(f"git history (line {lineno} of the log): {masked}")
     else:
         staged = args.staged
@@ -166,10 +166,10 @@ def main() -> int:
             if pattern:
                 problems.append(f"{path}: forbidden path (matches {pattern!r})")
                 continue
-            text = file_text(path, staged)
-            if text is None:
+            content = file_text(path, staged)
+            if content is None:
                 continue
-            for lineno, masked in scan_text(text, allowlist):
+            for lineno, masked in scan_text(content, allowlist):
                 problems.append(f"{path}:{lineno}: {masked}")
 
     if not problems:
