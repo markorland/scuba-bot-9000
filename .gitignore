@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- scuba-bot-9000 ---------------------------------------------------------
+# This repo is public and holds no personal data. Anything below belongs in the
+# private companion repo or on the host, never here. scripts/check_pii.py
+# enforces the same list, because .gitignore does not stop `git add -f`.
+config/config.yaml
+roster.yaml
+roster.yml
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+snapshots/
+tests/fixtures/real/
