@@ -748,7 +748,9 @@ truth rather than the delivery mechanism.
 | `deploy.yml` | private | **self-hosted** | `workflow_dispatch` + nightly | Render `.env`, sync `roster.yaml`, `docker compose pull && up -d` | all of them |
 | `snapshot.yml` | private | **self-hosted** | nightly, after the bot's run | Commit the day's `sqlite3 .dump` | `GITHUB_TOKEN` |
 
-**Private repo secrets:** `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, `BOOTSTRAP_ADMIN_EMAILS`.
+**Private repo secrets:** `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, `BOOTSTRAP_ADMIN_EMAILS`, and
+`DARK_RECIPIENT` while soaking (see *Send modes*). `deploy.yml` renders them into `.env` on the
+host.
 **Public repo secrets: none.**
 
 That list is shorter than it would otherwise be for two reasons. There is no `DEPLOY_SSH_KEY` or
