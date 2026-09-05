@@ -56,7 +56,7 @@ repo layout*.
 | Host | TrueNAS, **not reachable from the internet** — a self-hosted runner dials out to GitHub |
 | Secrets | GitHub Secrets on the **private** repo, rendered to `.env` on the host by the deploy job |
 | Deployment | `deploy.yml` on the self-hosted runner: render `.env`, sync roster, `compose pull && up -d` |
-| Backup | SQLite snapshot committed to the **private** data repo after each run |
+| Backup | SQLite snapshot committed to the **private** data repo, but only when state actually changed |
 | Year rollover | On the first assignment of a new year: assign → reply → summary email → purge → reset snapshots |
 | Data retention | Current year only, in the live database *and* in the snapshots |
 | Year summary | Its own email, `Steelhead <year> — year in review`; the only surviving record |
@@ -209,7 +209,10 @@ Use a tz-aware schedule, not a fixed UTC offset, so the run stays at 8am local a
 PST/PDT switch.
 
 1. **Fetch** unprocessed messages. Skip any whose `Message-ID` is already in `processed_messages`
-   — this is the primary idempotency guard, not "unseen" flags.
+   — this is the primary idempotency guard, not "unseen" flags. **Only messages the bot acts on are
+   recorded there**; anything ignored is simply re-classified next run, which is cheap, deterministic
+   and cannot produce a duplicate reply. Recording ignored mail would mean a stray newsletter counts
+   as a database change and triggers a snapshot commit on an otherwise quiet day.
 2. **Classify** each message by subject (see *Schedule email identification* below): new schedule,
    reply to a known thread, or ignore. A message can be both — a reply may carry commands.
 3. **Schedule email** → trim signature/quotes → take the **first date block** → parse names →
@@ -224,6 +227,10 @@ PST/PDT switch.
 Credit is awarded at *finalization*, not at assignment time, so `/none` and `/worked` have a
 window to land first. Ranking counts confirmed **plus** still-pending assignments, so nobody gets
 picked twice in a row while their first assignment is un-finalized.
+
+**Most runs do nothing.** On a typical weekday there is no new schedule email and no reply, so the
+run fetches, classifies nothing, finalizes nothing and exits. That is the expected case, and the
+rest of the design leans on it: no snapshot commit, no email, one log line.
 
 **Missed-run catch-up:** on startup, if the most recent `runs` row is older than today, run
 immediately. A container restart must never silently skip a week.
@@ -713,9 +720,11 @@ a failed or missing scheduled run shows in the Actions tab. Two things still wor
 
 - The bot logs its **image digest and roster commit SHA at startup**, and `/stats` reports both, so
   staleness is answerable from the email interface without opening GitHub.
-- GitHub disables scheduled workflows after 60 days without repository activity. The nightly
-  snapshot commit is itself activity, so the schedules keep each other alive — but that is a
-  dependency worth knowing about rather than rediscovering when the bot goes quiet.
+- GitHub disables scheduled workflows in repositories that go without activity for 60 days. Since
+  snapshots now commit only when something changed, the thing keeping that clock alive is the
+  **weekly** assignment, not a nightly commit — comfortably inside the window during the season,
+  but a long closure with no Sundays could silently disable the nightly deploy schedule. If the bot
+  goes quiet after a long break, check the Actions tab before debugging anything else.
 
 ### Backup to the private data repo
 
@@ -736,7 +745,18 @@ live database on the volume; the dump is the durable copy.
   `GITHUB_TOKEN`. That keeps every Git credential inside a job GitHub scopes and expires, rather
   than a long-lived deploy key sitting on the NAS, and the container then needs no access to
   GitHub at all.
-- Commit only when the dump actually changed, so quiet weeks generate no noise.
+- **Only commit when something meaningful changed.** Most days are a no-op: the bot checks the
+  mailbox, finds no new schedule email and no replies, and stops. Those days must produce no commit
+  at all — not an empty one, not a timestamp-only one.
+
+  The catch is that a naive dump changes *every* day regardless, because the run itself writes a
+  `runs` row. So **the dump excludes `runs`**, and the workflow commits only if `git diff --quiet`
+  says the file actually differs. `runs` is operational telemetry — it drives missed-run catch-up
+  and nothing else — and the worst consequence of it being absent from a restore is one extra
+  catch-up run. Everything that matters for fairness, identity or audit is still in the dump.
+
+  With that in place, a quiet week is genuinely silent and every commit in `snapshots/` corresponds
+  to something real: an assignment, a credit, a roster change, a correction.
 - `db restore <file>` CLI command, and **test it** — an untested backup is not a backup.
 - `db export-roster` regenerates `roster.yaml` from the live DB; commit it whenever the roster
   changes so the rebuild recipe stays current.
@@ -783,6 +803,9 @@ live database on the volume; the dump is the durable copy.
   peers over the following month.
 - **Idempotency** — feed the same schedule email twice; assert exactly one assignment and one set
   of credits.
+- **Quiet day is silent** — run with an empty mailbox, then with a mailbox holding only an
+  unrelated message. Assert in both cases that the exported dump is byte-identical to the previous
+  one, so no snapshot commit is produced, and that no email is sent.
 - **Command auth** — unknown sender refused; non-admin member refused for `/add-member` but allowed
   for `/stats`; quoted `/none` in a reply body is ignored.
 - **Subject parsing** — `Aquarium Sunday 03/08/2026`, `Re: Fwd: aquarium sunday 3-8-26`, a subject
